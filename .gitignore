@@ -5,3 +5,9 @@ node_modules/
 .env
 .env.local
 *.pyc
+backend/uploads/
+backend/results/
+backend/models_weights/
+*.mp4
+*.avi
+*.mov

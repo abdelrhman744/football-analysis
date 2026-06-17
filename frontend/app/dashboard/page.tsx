@@ -2,21 +2,21 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import Image from "next/image";
 import {
-  Users, Target, Activity, BarChart2, Zap, Upload,
+  Users, Target, Activity, Zap, Upload,
   Eye, GitBranch, Clock, Video, CheckCircle2, AlertCircle,
-  Cpu, Info
+  Info, Shield
 } from "lucide-react";
 import StatsCard from "@/components/StatsCard";
 import HeatmapPreview from "@/components/HeatmapPreview";
 import RecommendationCard from "@/components/RecommendationCard";
 import {
   getAnalysisResult, getCvStatus, FullAnalysisResult,
+  TeamClassificationResult,
   CvStatus, formatBytes, BACKEND_BASE
 } from "@/lib/api";
 
-// ── Small helper components ────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────
 
 function ModelBadge({ status }: { status: CvStatus | null }) {
   if (!status) return null;
@@ -49,41 +49,58 @@ function PlaceholderBadge() {
   );
 }
 
-// ── Processed Video Player ─────────────────────────────────────────────────
+function RealBadge() {
+  return (
+    <span className="ml-2 inline-flex items-center gap-1 text-xs text-pitch-400 border border-pitch-500/20 rounded-full px-2 py-0.5">
+      <CheckCircle2 className="h-3 w-3" /> real data
+    </span>
+  );
+}
 
-function VideoPlayer({ videoId, hasMeta }: { videoId: string; hasMeta: boolean }) {
+// ── Video Player ──────────────────────────────────────────────────────────
+
+function VideoPlayer({ videoId }: { videoId: string }) {
+  const [loaded, setLoaded] = useState(false);
+  const [errored, setErrored] = useState(false);
   const src = `${BACKEND_BASE}/results/${videoId}/processed.mp4`;
+
   return (
     <div className="glass-card rounded-xl p-6 mb-6">
       <SectionHeading>Processed Video</SectionHeading>
       <div className="aspect-video rounded-lg overflow-hidden bg-black relative">
         <video
+          key={src}
           controls
           className="w-full h-full object-contain"
           preload="metadata"
           src={src}
-          onError={(e) => {
-            // Hide video element and show placeholder when real file missing
-            (e.target as HTMLVideoElement).style.display = "none";
-          }}
+          onLoadedData={() => setLoaded(true)}
+          onError={() => setErrored(true)}
         />
-        {/* Fallback overlay */}
-        <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none bg-navy-900/80">
-          <Video className="h-12 w-12 text-slate-700 mb-3" />
-          <p className="text-sm text-slate-600">
-            Annotated video will appear here after the real CV model runs.
-          </p>
-        </div>
+        {/* Overlay only shown while video hasn't loaded */}
+        {!loaded && (
+          <div className="absolute inset-0 flex flex-col items-center justify-center bg-navy-900/80 pointer-events-none">
+            {errored ? (
+              <>
+                <AlertCircle className="h-12 w-12 text-red-500/60 mb-3" />
+                <p className="text-sm text-red-400">Video could not be loaded</p>
+                <p className="text-xs text-slate-600 mt-1 font-mono">{src}</p>
+              </>
+            ) : (
+              <>
+                <Video className="h-12 w-12 text-slate-700 mb-3" />
+                <p className="text-sm text-slate-500">Loading annotated video…</p>
+              </>
+            )}
+          </div>
+        )}
       </div>
-      <p className="text-xs text-slate-600 mt-2">
-        Annotated output saved to{" "}
-        <span className="font-mono">backend/results/{videoId}/processed.mp4</span>
-      </p>
+      <p className="text-xs text-slate-600 mt-2 font-mono">{src}</p>
     </div>
   );
 }
 
-// ── Detection Summary ──────────────────────────────────────────────────────
+// ── Detection Section ─────────────────────────────────────────────────────
 
 function DetectionSection({ detection, usedReal }: {
   detection: FullAnalysisResult["detection"];
@@ -94,19 +111,19 @@ function DetectionSection({ detection, usedReal }: {
     <div className="glass-card rounded-xl p-6 mb-6">
       <div className="flex items-center gap-2 mb-5">
         <SectionHeading>Detection Summary</SectionHeading>
-        {!usedReal && <PlaceholderBadge />}
+        {usedReal ? <RealBadge /> : <PlaceholderBadge />}
       </div>
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
         <StatsCard title="Frames Analyzed" value={detection.total_frames_analyzed.toLocaleString()} icon={Eye} subtitle="CV model output" />
         <StatsCard title="Players Detected" value={detection.players_detected} icon={Users} accent subtitle="Unique player IDs" />
         <StatsCard title="Ball Frames" value={detection.ball_detections.toLocaleString()} icon={Target} subtitle="Frames with ball" />
-        <StatsCard title="Detection Status" value={detection.status === "completed" ? "Done" : detection.status} icon={CheckCircle2} accent={detection.status === "completed"} />
+        <StatsCard title="Status" value={detection.status === "completed" ? "Done" : detection.status} icon={CheckCircle2} accent={detection.status === "completed"} />
       </div>
     </div>
   );
 }
 
-// ── Tracking Summary ───────────────────────────────────────────────────────
+// ── Tracking Section ──────────────────────────────────────────────────────
 
 function TrackingSection({ tracking, usedReal }: {
   tracking: FullAnalysisResult["tracking"];
@@ -117,57 +134,203 @@ function TrackingSection({ tracking, usedReal }: {
     <div className="glass-card rounded-xl p-6 mb-6">
       <div className="flex items-center gap-2 mb-5">
         <SectionHeading>Tracking Result</SectionHeading>
-        {!usedReal && <PlaceholderBadge />}
+        {usedReal ? <RealBadge /> : <PlaceholderBadge />}
       </div>
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-5">
         <StatsCard title="Players Tracked" value={tracking.total_players_tracked} icon={GitBranch} accent />
         <StatsCard title="Ball Positions" value={tracking.ball_track.length} icon={Activity} subtitle="Recorded positions" />
-        <StatsCard title="Tracking Status" value={tracking.status === "completed" ? "Done" : tracking.status} icon={CheckCircle2} accent={tracking.status === "completed"} />
+        <StatsCard title="Status" value={tracking.status === "completed" ? "Done" : tracking.status} icon={CheckCircle2} accent={tracking.status === "completed"} />
         <StatsCard title="Teams" value="2" icon={Users} subtitle="A & B classified" />
       </div>
-
-      {tracking.player_tracks.length > 0 && (
-        <>
-          <h3 className="text-sm font-semibold text-slate-400 mb-3 uppercase tracking-wider">
-            Top Players by Distance
-          </h3>
-          <div className="space-y-2">
-            {tracking.player_tracks
-              .filter((t) => t.total_distance_meters != null)
-              .sort((a, b) => (b.total_distance_meters ?? 0) - (a.total_distance_meters ?? 0))
-              .slice(0, 5)
-              .map((t) => (
-                <div key={t.player_id} className="flex items-center gap-3 py-2 border-b border-white/4">
-                  <span className="text-xs font-mono text-slate-500 w-12">#{t.player_id}</span>
-                  <span className={`text-xs px-2 py-0.5 rounded-full ${
-                    t.team === "Team A"
-                      ? "bg-white/10 text-white"
-                      : "bg-blue-900/40 text-blue-300"
-                  }`}>{t.team ?? "—"}</span>
-                  <div className="flex-1 h-1.5 rounded-full bg-white/5">
-                    <div
-                      className="h-full rounded-full bg-pitch-500/60"
-                      style={{ width: `${Math.min(100, ((t.total_distance_meters ?? 0) / 12000) * 100)}%` }}
-                    />
-                  </div>
-                  <span className="text-xs text-slate-400 w-20 text-right">
-                    {t.total_distance_meters != null
-                      ? `${(t.total_distance_meters / 1000).toFixed(2)} km`
-                      : "—"}
-                  </span>
-                  <span className="text-xs text-slate-600 w-20 text-right">
-                    {t.max_speed_kmh != null ? `${t.max_speed_kmh} km/h` : "—"}
-                  </span>
-                </div>
-              ))}
-          </div>
-        </>
-      )}
     </div>
   );
 }
 
-// ── Main Dashboard ─────────────────────────────────────────────────────────
+// ── Team Classification Section ───────────────────────────────────────────
+
+function TeamClassificationSection({ tc }: { tc: TeamClassificationResult }) {
+  const isReal =
+    tc.team_a_color !== "#FFFFFF" ||
+    tc.team_b_color !== "#003366" ||
+    tc.team_a_players.length !== 11 ||
+    tc.team_b_players.length !== 11;
+
+  const allPlayers = [
+    ...tc.team_a_players.map(p => ({ ...p, team: "A" as const })),
+    ...tc.team_b_players.map(p => ({ ...p, team: "B" as const })),
+  ].sort((a, b) => a.player_id - b.player_id);
+
+  const avgConfA =
+    tc.team_a_players.length > 0
+      ? tc.team_a_players.reduce((s, p) => s + p.confidence, 0) / tc.team_a_players.length
+      : 0;
+  const avgConfB =
+    tc.team_b_players.length > 0
+      ? tc.team_b_players.reduce((s, p) => s + p.confidence, 0) / tc.team_b_players.length
+      : 0;
+
+  return (
+    <div className="glass-card rounded-xl p-6 mb-6">
+      {/* Header */}
+      <div className="flex items-center gap-2 mb-6">
+        <SectionHeading>Team Classification</SectionHeading>
+        {isReal ? <RealBadge /> : <PlaceholderBadge />}
+      </div>
+
+      {/* Diagnostic banner when not real */}
+      {!isReal && (
+        <div className="mb-5 rounded-lg border border-yellow-500/15 bg-yellow-500/5 px-4 py-3 flex items-start gap-3">
+          <AlertCircle className="h-4 w-4 text-yellow-400 shrink-0 mt-0.5" />
+          <p className="text-xs text-yellow-300/80">
+            Team classification returned placeholder data. This means the CV model
+            did not run, or the assignments file was not generated. Re-run analysis
+            with model weights present.
+          </p>
+        </div>
+      )}
+
+      {/* Team color cards */}
+      <div className="grid grid-cols-2 gap-4 mb-6">
+        {[
+          {
+            label: tc.team_a_label,
+            color: tc.team_a_color ?? "#FFFFFF",
+            count: tc.team_a_players.length,
+            avgConf: avgConfA,
+            players: tc.team_a_players,
+          },
+          {
+            label: tc.team_b_label,
+            color: tc.team_b_color ?? "#003366",
+            count: tc.team_b_players.length,
+            avgConf: avgConfB,
+            players: tc.team_b_players,
+          },
+        ].map(({ label, color, count, avgConf, players }) => (
+          <div key={label} className="rounded-xl border border-white/5 bg-white/3 p-4">
+            <div className="flex items-center gap-3 mb-3">
+              <div
+                className="h-10 w-10 rounded-lg border border-white/15 shrink-0 shadow-lg"
+                style={{ backgroundColor: color }}
+                title={color}
+              />
+              <div>
+                <p className="font-semibold text-white">{label}</p>
+                <p className="text-xs text-slate-500 font-mono">{color}</p>
+              </div>
+            </div>
+            <div className="grid grid-cols-2 gap-2 text-center">
+              <div className="rounded-lg bg-white/3 py-2">
+                <p className="text-xl font-display font-600 text-white">{count}</p>
+                <p className="text-xs text-slate-500">players</p>
+              </div>
+              <div className="rounded-lg bg-white/3 py-2">
+                <p className="text-xl font-display font-600 text-pitch-400">
+                  {count > 0 ? `${(avgConf * 100).toFixed(0)}%` : "—"}
+                </p>
+                <p className="text-xs text-slate-500">avg conf</p>
+              </div>
+            </div>
+            {/* Player ID chips */}
+            <div className="mt-3 flex flex-wrap gap-1">
+              {players.slice(0, 20).map(p => (
+                <span
+                  key={p.player_id}
+                  className="inline-block rounded px-1.5 py-0.5 text-xs font-mono"
+                  style={{
+                    backgroundColor: color + "22",
+                    color: color,
+                    border: `1px solid ${color}44`,
+                  }}
+                  title={`Confidence: ${(p.confidence * 100).toFixed(1)}%  Color: ${p.dominant_color}`}
+                >
+                  #{p.player_id}
+                </span>
+              ))}
+              {players.length > 20 && (
+                <span className="text-xs text-slate-600 self-center">
+                  +{players.length - 20} more
+                </span>
+              )}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {/* Player assignment table */}
+      <h3 className="text-sm font-semibold text-slate-400 uppercase tracking-wider mb-3">
+        Player Assignments
+      </h3>
+      <div className="overflow-x-auto rounded-lg border border-white/5">
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="border-b border-white/5 bg-white/2">
+              <th className="px-4 py-2.5 text-left text-xs font-medium text-slate-500 uppercase tracking-wider">Player ID</th>
+              <th className="px-4 py-2.5 text-left text-xs font-medium text-slate-500 uppercase tracking-wider">Team</th>
+              <th className="px-4 py-2.5 text-left text-xs font-medium text-slate-500 uppercase tracking-wider">Confidence</th>
+              <th className="px-4 py-2.5 text-left text-xs font-medium text-slate-500 uppercase tracking-wider">Jersey Color</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-white/3">
+            {allPlayers.map(player => {
+              const teamColor = player.team === "A"
+                ? (tc.team_a_color ?? "#FFFFFF")
+                : (tc.team_b_color ?? "#003366");
+              const confPct = Math.round(player.confidence * 100);
+              return (
+                <tr key={player.player_id} className="hover:bg-white/2 transition-colors">
+                  <td className="px-4 py-2.5 font-mono text-slate-300">#{player.player_id}</td>
+                  <td className="px-4 py-2.5">
+                    <span
+                      className="inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-xs font-medium"
+                      style={{
+                        backgroundColor: teamColor + "22",
+                        color: teamColor,
+                        border: `1px solid ${teamColor}44`,
+                      }}
+                    >
+                      <Shield className="h-3 w-3" />
+                      {player.team_label}
+                    </span>
+                  </td>
+                  <td className="px-4 py-2.5">
+                    <div className="flex items-center gap-2">
+                      <div className="flex-1 max-w-[80px] h-1.5 rounded-full bg-white/5">
+                        <div
+                          className="h-full rounded-full"
+                          style={{
+                            width: `${confPct}%`,
+                            backgroundColor: confPct >= 80 ? "#4ade80" : confPct >= 60 ? "#facc15" : "#f87171",
+                          }}
+                        />
+                      </div>
+                      <span className="text-xs text-slate-400 w-10 text-right">{confPct}%</span>
+                    </div>
+                  </td>
+                  <td className="px-4 py-2.5">
+                    {player.dominant_color ? (
+                      <div className="flex items-center gap-2">
+                        <div
+                          className="h-4 w-4 rounded border border-white/10 shrink-0"
+                          style={{ backgroundColor: player.dominant_color }}
+                        />
+                        <span className="text-xs font-mono text-slate-500">{player.dominant_color}</span>
+                      </div>
+                    ) : (
+                      <span className="text-xs text-slate-600">—</span>
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+// ── Main Dashboard ────────────────────────────────────────────────────────
 
 export default function DashboardPage() {
   const [result, setResult]     = useState<FullAnalysisResult | null>(null);
@@ -177,12 +340,14 @@ export default function DashboardPage() {
   const [error, setError]       = useState<string | null>(null);
 
   useEffect(() => {
-    const videoId  = localStorage.getItem("lastVideoId");
-    const metaRaw  = localStorage.getItem("lastVideoMeta");
+    const videoId = localStorage.getItem("lastVideoId");
+    const metaRaw = localStorage.getItem("lastVideoMeta");
     if (metaRaw) setMeta(JSON.parse(metaRaw));
 
     Promise.all([
-      videoId ? getAnalysisResult(videoId).catch((e) => { setError(e.message); return null; }) : Promise.resolve(null),
+      videoId
+        ? getAnalysisResult(videoId).catch(e => { setError(e.message); return null; })
+        : Promise.resolve(null),
       getCvStatus(),
     ]).then(([r, cv]) => {
       setResult(r);
@@ -216,7 +381,6 @@ export default function DashboardPage() {
   }
 
   const { detection, tracking, heatmap, team_classification, match_stats, ai_summary, processing_time_seconds } = result;
-  // Determine if real model was used (persisted in cv_meta, approximate via heatmap url presence)
   const usedReal = !!(heatmap?.team_a_heatmap_url);
 
   return (
@@ -246,7 +410,7 @@ export default function DashboardPage() {
           </div>
         </div>
 
-        {/* CV model not loaded warning */}
+        {/* CV model warning */}
         {!cvStatus?.cv_model_available && (
           <div className="glass-card rounded-xl px-5 py-4 mb-6 flex items-start gap-3 border border-yellow-500/15">
             <AlertCircle className="h-5 w-5 text-yellow-400 shrink-0 mt-0.5" />
@@ -254,8 +418,8 @@ export default function DashboardPage() {
               <p className="text-sm font-medium text-yellow-400 mb-0.5">Placeholder Mode Active</p>
               <p className="text-xs text-slate-500">
                 The real CV model weights are not loaded. Results shown are synthetic.
-                Place your <span className="font-mono">player_ball_detector.pt</span> in{" "}
-                <span className="font-mono">backend/models_weights/</span> and restart the server.
+                Place <span className="font-mono">player_ball_detector.pt</span> in{" "}
+                <span className="font-mono">backend/models_weights/</span> and restart.
               </p>
             </div>
           </div>
@@ -272,7 +436,7 @@ export default function DashboardPage() {
         )}
 
         {/* Processed video */}
-        <VideoPlayer videoId={result.video_id} hasMeta={!!meta} />
+        <VideoPlayer videoId={result.video_id} />
 
         {/* Detection */}
         <DetectionSection detection={detection} usedReal={usedReal} />
@@ -282,13 +446,6 @@ export default function DashboardPage() {
 
         {/* Heatmap */}
         <div className="mb-6">
-          <div className="flex items-center gap-2 mb-1">
-            {!usedReal && (
-              <div className="ml-auto">
-                <PlaceholderBadge />
-              </div>
-            )}
-          </div>
           <HeatmapPreview matrix={heatmap?.heatmap_matrix ?? null} />
           {heatmap?.team_a_heatmap_url && (
             <div className="mt-3 glass-card rounded-xl p-4">
@@ -297,21 +454,13 @@ export default function DashboardPage() {
                 {heatmap.team_a_heatmap_url && (
                   <div>
                     <p className="text-xs text-slate-600 mb-1">Players</p>
-                    <img
-                      src={`${BACKEND_BASE}${heatmap.team_a_heatmap_url}`}
-                      alt="Player heatmap"
-                      className="w-full rounded-lg object-cover"
-                    />
+                    <img src={`${BACKEND_BASE}${heatmap.team_a_heatmap_url}`} alt="Player heatmap" className="w-full rounded-lg object-cover" />
                   </div>
                 )}
                 {heatmap.ball_heatmap_url && (
                   <div>
                     <p className="text-xs text-slate-600 mb-1">Ball</p>
-                    <img
-                      src={`${BACKEND_BASE}${heatmap.ball_heatmap_url}`}
-                      alt="Ball heatmap"
-                      className="w-full rounded-lg object-cover"
-                    />
+                    <img src={`${BACKEND_BASE}${heatmap.ball_heatmap_url}`} alt="Ball heatmap" className="w-full rounded-lg object-cover" />
                   </div>
                 )}
               </div>
@@ -319,27 +468,13 @@ export default function DashboardPage() {
           )}
         </div>
 
-        {/* Team classification */}
-        {team_classification && (
-          <div className="glass-card rounded-xl p-6 mb-6">
-            <div className="flex items-center gap-2 mb-5">
-              <SectionHeading>Team Classification</SectionHeading>
-              <PlaceholderBadge />
-            </div>
-            <div className="grid grid-cols-2 gap-4">
-              {[
-                { label: team_classification.team_a_label, color: team_classification.team_a_color ?? "#fff", count: team_classification.team_a_players?.length ?? 0 },
-                { label: team_classification.team_b_label, color: team_classification.team_b_color ?? "#003366", count: team_classification.team_b_players?.length ?? 0 },
-              ].map(({ label, color, count }) => (
-                <div key={label} className="flex items-center gap-4 rounded-xl bg-white/3 p-4">
-                  <div className="h-10 w-10 rounded-lg border border-white/10 shrink-0" style={{ backgroundColor: color }} />
-                  <div>
-                    <p className="font-semibold text-white">{label}</p>
-                    <p className="text-sm text-slate-500">{count} players classified</p>
-                  </div>
-                </div>
-              ))}
-            </div>
+        {/* Team Classification — real component */}
+        {team_classification ? (
+          <TeamClassificationSection tc={team_classification} />
+        ) : (
+          <div className="glass-card rounded-xl p-6 mb-6 flex items-center gap-3">
+            <AlertCircle className="h-5 w-5 text-slate-600 shrink-0" />
+            <p className="text-sm text-slate-500">Team classification data unavailable.</p>
           </div>
         )}
 
@@ -376,9 +511,6 @@ export default function DashboardPage() {
                       { l: "Passes", v: team.passes },
                       { l: "Pass %", v: team.pass_accuracy != null ? `${team.pass_accuracy}%` : null },
                       { l: "Fouls", v: team.fouls },
-                      { l: "Corners", v: team.corners },
-                      { l: "Yellow", v: team.yellow_cards },
-                      { l: "Red", v: team.red_cards },
                     ].map(({ l, v }) => (
                       <div key={l} className="text-center py-2 px-1 rounded-lg bg-white/2">
                         <div className="text-lg font-display font-600 text-white">{v ?? "—"}</div>
