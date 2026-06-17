@@ -90,7 +90,7 @@ def classify_teams(video_id: str, detection_result) -> TeamClassificationResult:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _locate_assignments(video_id: str, detection_result) -> Optional[Path]:
-    """Return path to processed_team_assignments.json, or None if not found."""
+    """Return path to *_team_assignments.json, or None if not found."""
     # 1. Check ProcessingOutput.team_assignments_path (set by video_processor)
     cv_out = getattr(detection_result, "_cv_output", None)
     if cv_out is not None:
@@ -141,10 +141,11 @@ def _from_assignments_file(
             len(assignments), team_1_hex, team_2_hex,
         )
 
-        # Compute confidence scores using per-player jersey colors
-        player_colors = _extract_jersey_colors(video_id, detection_result, assignments)
-
+        # Inter-cluster distance for confidence scoring
         inter_dist = float(np.linalg.norm(team_1_bgr - team_2_bgr)) or 1.0
+
+        # Extract jersey colours for confidence scoring
+        player_colors = _extract_jersey_colors(video_id, detection_result, assignments)
 
         team_a_players: list[TeamPlayer] = []
         team_b_players: list[TeamPlayer] = []
@@ -152,14 +153,20 @@ def _from_assignments_file(
         for tid_str, team_id in sorted(assignments.items(), key=lambda x: int(x[0])):
             tid        = int(tid_str)
             center_bgr = team_1_bgr if team_id == 1 else team_2_bgr
+            other_bgr  = team_2_bgr if team_id == 1 else team_1_bgr
             color_bgr  = player_colors.get(tid)
 
             if color_bgr is not None:
-                dist = float(np.linalg.norm(color_bgr - center_bgr))
-                conf = round(max(0.50, min(0.99, 1.0 - dist / inter_dist)), 3)
+                d_own   = float(np.linalg.norm(color_bgr - center_bgr))
+                d_other = float(np.linalg.norm(color_bgr - other_bgr))
+                denom   = d_own + d_other
+                if denom < 1e-6:
+                    conf = 0.85
+                else:
+                    conf = round(max(0.50, min(0.99, d_other / denom)), 3)
                 hex_c = _bgr_to_hex(color_bgr)
             else:
-                conf  = 0.80
+                conf  = 0.75
                 hex_c = team_1_hex if team_id == 1 else team_2_hex
 
             player = TeamPlayer(
@@ -216,7 +223,7 @@ def _extract_jersey_colors(
 
         clf_tmp     = TeamClassifier()
         target_tids = {int(k) for k in assignments}
-        colors: dict[int, np.ndarray] = {}
+        colors: dict[int, list[np.ndarray]] = {}
 
         for entry in det_data:
             fi = int(entry["frame"])
@@ -225,17 +232,23 @@ def _extract_jersey_colors(
             frame = frames[fi]
             for det in entry.get("detections", []):
                 tid = det.get("tracker_id")
-                if tid is None or int(tid) not in target_tids or int(tid) in colors:
+                if tid is None or int(tid) not in target_tids:
                     continue
                 c = clf_tmp.get_jersey_color_for(frame, det["bbox"])
                 if c is not None and c.sum() > 0:
-                    colors[int(tid)] = c
+                    colors.setdefault(int(tid), []).append(c)
+
+        # Median per player (more robust than first sample)
+        medians: dict[int, np.ndarray] = {}
+        for tid, samples in colors.items():
+            arr = np.stack(samples, axis=0)
+            medians[tid] = np.median(arr, axis=0).astype(np.float64)
 
         log.debug(
             "[team_classification] Extracted jersey colors for %d/%d players",
-            len(colors), len(target_tids),
+            len(medians), len(target_tids),
         )
-        return colors
+        return medians
 
     except Exception as exc:
         log.debug("[team_classification] _extract_jersey_colors failed: %s", exc)
@@ -284,34 +297,60 @@ def _classify_from_scratch(video_id: str, detection_result) -> TeamClassificatio
         clf.team_hex_color(1), clf.team_hex_color(2),
     )
 
-    last_frame = frames[-1]
+    # Accumulate votes across all training frames
+    for fi, frame_tracks in enumerate(player_tracks):
+        ref = frames[fi] if fi < len(frames) else frames[-1]
+        for tid, info in frame_tracks.items():
+            try:
+                clf.accumulate_vote(ref, info["bbox"], tid)
+            except Exception:
+                pass
+
     team_a_players: list[TeamPlayer] = []
     team_b_players: list[TeamPlayer] = []
 
-    for fi, frame_tracks in enumerate(player_tracks):
-        ref = frames[fi] if fi < len(frames) else last_frame
-        for tid, info in frame_tracks.items():
-            if tid in clf._cache:
-                continue
-            try:
-                team_id   = clf.predict(ref, info["bbox"], tid)
-                color_bgr = clf.get_jersey_color_for(ref, info["bbox"])
-                if color_bgr is None:
-                    color_bgr = clf.team_colors.get(team_id, np.zeros(3))
-                conf    = clf.confidence(color_bgr, team_id)
-                hex_col = _bgr_to_hex(color_bgr)
-                (team_a_players if team_id == 1 else team_b_players).append(
-                    TeamPlayer(
-                        player_id=tid,
-                        team_label="Team A" if team_id == 1 else "Team B",
-                        confidence=conf,
-                        dominant_color=hex_col,
-                    )
-                )
-            except Exception as exc:
-                log.debug("[team_classification] Skip track %d: %s", tid, exc)
+    for tid in stable_ids:
+        # Find a representative frame + bbox for this track
+        ref_frame = frames[-1]
+        ref_bbox  = None
+        for fi, frame_tracks in enumerate(player_tracks):
+            if tid in frame_tracks:
+                ref_frame = frames[fi] if fi < len(frames) else frames[-1]
+                ref_bbox  = frame_tracks[tid]["bbox"]
+                break
 
-    # Save the result for future fast-path use
+        if ref_bbox is None:
+            continue
+
+        try:
+            team_id   = clf.predict(ref_frame, ref_bbox, tid)
+            if team_id == 0:
+                continue  # referee
+
+            # Use median colour for confidence
+            color_bgr = clf.get_median_jersey_color(tid)
+            if color_bgr is None:
+                color_bgr = clf.get_jersey_color_for(ref_frame, ref_bbox)
+            if color_bgr is None:
+                color_bgr = clf.team_colors.get(team_id, np.zeros(3))
+
+            # Vote-based confidence is most reliable after multi-frame accumulation
+            vote_conf  = clf.vote_confidence(tid)
+            color_conf = clf.confidence(color_bgr, team_id)
+            conf       = round((vote_conf + color_conf) / 2, 3)
+            hex_col    = _bgr_to_hex(color_bgr)
+
+            (team_a_players if team_id == 1 else team_b_players).append(
+                TeamPlayer(
+                    player_id=tid,
+                    team_label="Team A" if team_id == 1 else "Team B",
+                    confidence=conf,
+                    dominant_color=hex_col,
+                )
+            )
+        except Exception as exc:
+            log.debug("[team_classification] Skip track %d: %s", tid, exc)
+
     _persist_assignments_from_classifier(clf, video_id)
 
     return TeamClassificationResult(
@@ -330,16 +369,20 @@ def _persist_assignments_from_classifier(clf: TeamClassifier, video_id: str) -> 
     """Save assignments JSON so fast-path is available on next dashboard load."""
     try:
         out = Path(RESULTS_DIR) / video_id / "processed_team_assignments.json"
+        assignments = {str(k): int(v) for k, v in clf._cache.items() if v in (1, 2)}
         payload = {
             "team_1_color_hex": clf.team_hex_color(1),
             "team_2_color_hex": clf.team_hex_color(2),
             "team_1_color_bgr": [int(v) for v in clf.team_colors.get(1, [0, 0, 0])],
             "team_2_color_bgr": [int(v) for v in clf.team_colors.get(2, [0, 0, 0])],
-            "assignments": {str(k): int(v) for k, v in clf._cache.items()},
+            "assignments": assignments,
         }
         with open(out, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
-        log.info("[team_classification] Persisted %d assignments → %s", len(payload["assignments"]), out)
+        log.info(
+            "[team_classification] Persisted %d assignments → %s",
+            len(assignments), out,
+        )
     except Exception as exc:
         log.debug("[team_classification] _persist_assignments_from_classifier: %s", exc)
 

@@ -1,6 +1,7 @@
 """
 video_processor.py — CV pipeline with H.264 browser-compatible output
-and real-time team classification integrated into the frame loop.
+and improved team classification with multi-frame voting integrated into
+the frame loop.
 """
 
 import cv2
@@ -102,14 +103,14 @@ def process_video(
 ) -> dict[str, Any]:
 
     status: dict[str, Any] = {
-        "model_loaded":           False,
-        "video_opened":           False,
-        "frames_processed":       0,
-        "annotation_ready":       False,
-        "output_written":         False,
+        "model_loaded":            False,
+        "video_opened":            False,
+        "frames_processed":        0,
+        "annotation_ready":        False,
+        "output_written":          False,
         "team_classifier_trained": False,
         "team_assignments_count":  0,
-        "errors":                 [],
+        "errors":                  [],
     }
 
     # ── 1. Load YOLO model ────────────────────────────────────────────────────
@@ -170,15 +171,11 @@ def process_video(
     tracking_export:   list[dict[str, Any]] = []
 
     # Team classifier — two-phase approach:
-    #   Phase A: buffer first TRAINING_FRAMES worth of (frame, dets) pairs
-    #   Phase B: train once, then classify every subsequent player in-place
-    #
-    # IMPORTANT: clf._cache accumulates predictions for ALL frames (not just
-    # training frames) because _draw_team_annotations calls clf.predict() on
-    # every frame. By loop-end, clf._cache contains every stable tracker_id.
+    #   Phase A: buffer first TRAINING_FRAMES frames for training
+    #   Phase B: train once, then accumulate_vote() every frame, annotate
     team_clf: TeamClassifier | None = None
-    _train_buf_frames:  list[np.ndarray]         = []  # raw BGR frames
-    _train_buf_dets:    list[list[dict[str,Any]]] = []  # per-frame det lists
+    _train_buf_frames:  list[np.ndarray]          = []
+    _train_buf_dets:    list[list[dict[str, Any]]] = []
     frame_idx = 0
 
     while True:
@@ -227,44 +224,46 @@ def process_video(
             detections = sv.Detections.empty()
             frame_dets = []
 
-        # ── team classifier: buffer phase → then train → then annotate ────────
+        # ── team classifier: buffer → train → vote every frame ────────────────
         if team_clf is None:
             _train_buf_frames.append(frame.copy())
             _train_buf_dets.append(frame_dets)
 
             if len(_train_buf_frames) >= TRAINING_FRAMES:
                 logger.info(
-                    "[VideoProcessor] TeamClassifier: starting training on %d frames",
+                    "[VideoProcessor] TeamClassifier: training on %d frames",
                     len(_train_buf_frames),
                 )
-                team_clf = _train_team_classifier(
-                    _train_buf_frames, _train_buf_dets
-                )
+                team_clf = _train_team_classifier(_train_buf_frames, _train_buf_dets)
                 if team_clf is not None:
                     status["team_classifier_trained"] = True
                     logger.info(
-                        "[VideoProcessor] TeamClassifier: trained. "
-                        "Team1=%s Team2=%s",
+                        "[VideoProcessor] TeamClassifier trained. Team1=%s Team2=%s",
                         team_clf.team_hex_color(1),
                         team_clf.team_hex_color(2),
                     )
-                    # Classify players in the buffered training frames
-                    # so they appear in clf._cache before we reach future frames
-                    for buf_fi, (buf_frame, buf_dets) in enumerate(
-                        zip(_train_buf_frames, _train_buf_dets)
-                    ):
+                    # Accumulate votes for all buffered training frames
+                    for buf_frame, buf_dets in zip(_train_buf_frames, _train_buf_dets):
                         for det in buf_dets:
                             tid = det.get("tracker_id")
-                            if tid is not None and tid not in team_clf._cache:
+                            if tid is not None:
                                 try:
-                                    team_clf.predict(buf_frame, det["bbox"], int(tid))
+                                    team_clf.accumulate_vote(buf_frame, det["bbox"], int(tid))
                                 except Exception:
                                     pass
                 else:
-                    logger.warning("[VideoProcessor] TeamClassifier training failed — continuing without team colours")
-                # Free buffer memory
+                    logger.warning("[VideoProcessor] TeamClassifier training failed")
                 _train_buf_frames.clear()
                 _train_buf_dets.clear()
+        else:
+            # Accumulate votes for current frame players
+            for det in frame_dets:
+                tid = det.get("tracker_id")
+                if tid is not None:
+                    try:
+                        team_clf.accumulate_vote(frame, det["bbox"], int(tid))
+                    except Exception:
+                        pass
 
         # ── annotate frame ────────────────────────────────────────────────────
         try:
@@ -287,7 +286,7 @@ def process_video(
 
         frame_idx += 1
 
-    # If video shorter than TRAINING_FRAMES, train now on whatever we have
+    # Handle videos shorter than TRAINING_FRAMES
     if team_clf is None and _train_buf_frames:
         logger.info(
             "[VideoProcessor] Short video (%d frames) — training TeamClassifier now",
@@ -299,9 +298,9 @@ def process_video(
             for buf_frame, buf_dets in zip(_train_buf_frames, _train_buf_dets):
                 for det in buf_dets:
                     tid = det.get("tracker_id")
-                    if tid is not None and tid not in team_clf._cache:
+                    if tid is not None:
                         try:
-                            team_clf.predict(buf_frame, det["bbox"], int(tid))
+                            team_clf.accumulate_vote(buf_frame, det["bbox"], int(tid))
                         except Exception:
                             pass
         _train_buf_frames.clear()
@@ -312,6 +311,7 @@ def process_video(
 
     status["frames_processed"] = int(frame_idx)
     if team_clf is not None:
+        # Finalise any players that haven't hit MIN_VOTES yet via predict()
         status["team_assignments_count"] = len(team_clf._cache)
 
     logger.info(
@@ -319,7 +319,7 @@ def process_video(
         "classifier_trained=%s | assignments=%d",
         frame_idx, total_detections, len(unique_track_ids),
         status["team_classifier_trained"],
-        status["team_assignments_count"],
+        status.get("team_assignments_count", 0),
     )
 
     # ── 6. Re-encode to H.264 + faststart ────────────────────────────────────
@@ -381,7 +381,6 @@ def _train_team_classifier(
     Returns None on any failure — pipeline always continues.
     """
     try:
-        # Build player_tracks structure required by TeamClassifier.train()
         n = len(frames)
         player_tracks: list[dict[int, dict]] = [{} for _ in range(n)]
         track_counts: dict[int, int] = {}
@@ -394,21 +393,17 @@ def _train_team_classifier(
                     track_counts[tid] = track_counts.get(tid, 0) + 1
                     player_tracks[fi][tid] = {"bbox": det["bbox"]}
 
-        # Filter to stable tracks only
         stable = {tid for tid, cnt in track_counts.items() if cnt >= MIN_TRACK_APPEARANCES}
-
         if not stable:
-            # Relax threshold if we don't have enough data yet (short buffer)
             stable = {tid for tid, cnt in track_counts.items() if cnt >= 1}
             logger.info(
                 "[VideoProcessor] TeamClassifier: relaxed min_appearances to 1 "
-                "(only %d buffered frames)", n
+                "(%d buffered frames)", n
             )
 
         if not stable:
             raise ValueError("No tracked players in training frames")
 
-        # Filter player_tracks to stable tracks only
         filtered: list[dict[int, dict]] = [
             {tid: info for tid, info in pt.items() if tid in stable}
             for pt in player_tracks
@@ -419,7 +414,9 @@ def _train_team_classifier(
         return clf
 
     except Exception as exc:
-        logger.warning("[VideoProcessor] _train_team_classifier failed: %s", exc, exc_info=True)
+        logger.warning(
+            "[VideoProcessor] _train_team_classifier failed: %s", exc, exc_info=True
+        )
         return None
 
 
@@ -431,7 +428,7 @@ def _draw_team_ellipses(
 ) -> np.ndarray:
     """
     Draw a filled team-colour ellipse under each tracked player.
-    Uses the classifier's trained centroid colours.
+    Skips referees (team_id == 0 sentinel).
     Non-fatal — returns original frame on any error.
     """
     try:
@@ -445,6 +442,9 @@ def _draw_team_ellipses(
                 team_id = clf.predict(raw_frame, bbox, int(tid))
             except Exception:
                 continue
+
+            if team_id == 0:
+                continue  # referee — skip ellipse
 
             bgr_arr = clf.team_colors.get(team_id)
             if bgr_arr is not None:
@@ -494,18 +494,24 @@ def _save_team_assignments(
         return None
     try:
         path    = output_base + "_team_assignments.json"
+        # Only save players actually assigned to a team (exclude referee sentinel 0)
+        assignments = {
+            str(k): int(v)
+            for k, v in clf._cache.items()
+            if v in (1, 2)
+        }
         payload = {
             "team_1_color_hex": clf.team_hex_color(1),
             "team_2_color_hex": clf.team_hex_color(2),
             "team_1_color_bgr": [int(v) for v in clf.team_colors.get(1, [0, 0, 0])],
             "team_2_color_bgr": [int(v) for v in clf.team_colors.get(2, [0, 0, 0])],
-            "assignments":      {str(k): int(v) for k, v in clf._cache.items()},
+            "assignments":      assignments,
         }
         with open(path, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
         logger.info(
             "[VideoProcessor] Team assignments: %d players → %s",
-            len(payload["assignments"]), path,
+            len(assignments), path,
         )
         return path
     except Exception as exc:
@@ -604,11 +610,11 @@ def _build_result(cv_data: dict, status: dict) -> dict:
     result = {
         "real_cv_analysis": cv_data,
         "placeholder_sections": {
-            "possession":       {"_status": "PLACEHOLDER", "team_a": None, "team_b": None},
-            "shots_on_goal":    {"_status": "PLACEHOLDER", "count": None},
-            "expected_goals_xg":{"_status": "PLACEHOLDER", "value": None},
-            "tactical_analysis":{"_status": "PLACEHOLDER", "formation": None, "strengths": [], "weaknesses": [], "recommendations": []},
-            "match_statistics": {"_status": "PLACEHOLDER", "passes": None, "fouls": None, "corners": None},
+            "possession":        {"_status": "PLACEHOLDER", "team_a": None, "team_b": None},
+            "shots_on_goal":     {"_status": "PLACEHOLDER", "count": None},
+            "expected_goals_xg": {"_status": "PLACEHOLDER", "value": None},
+            "tactical_analysis": {"_status": "PLACEHOLDER", "formation": None, "strengths": [], "weaknesses": [], "recommendations": []},
+            "match_statistics":  {"_status": "PLACEHOLDER", "passes": None, "fouls": None, "corners": None},
         },
         "pipeline_status": numpy_to_python(status),
     }

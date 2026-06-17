@@ -5,7 +5,7 @@ import Link from "next/link";
 import {
   Users, Target, Activity, Zap, Upload,
   Eye, GitBranch, Clock, Video, CheckCircle2, AlertCircle,
-  Info, Shield
+  Info, Shield, Loader2, XCircle
 } from "lucide-react";
 import StatsCard from "@/components/StatsCard";
 import HeatmapPreview from "@/components/HeatmapPreview";
@@ -57,6 +57,27 @@ function RealBadge() {
   );
 }
 
+/**
+ * Determine whether team classification data is real (from the CV pipeline)
+ * vs placeholder (the hardcoded fallback values).
+ *
+ * The placeholder always returns exactly 11+11 players, white + navy colours.
+ * Any deviation from that pattern is treated as real data.
+ */
+function isRealTeamClassification(tc: TeamClassificationResult): boolean {
+  if (!tc) return false;
+  if (tc.status !== "completed") return false;
+  const totalPlayers = tc.team_a_players.length + tc.team_b_players.length;
+  if (totalPlayers === 0) return false;
+  // Placeholder sentinel: exactly 11+11 players with the default colours
+  const isPlaceholderSentinel =
+    tc.team_a_color === "#FFFFFF" &&
+    tc.team_b_color === "#003366" &&
+    tc.team_a_players.length === 11 &&
+    tc.team_b_players.length === 11;
+  return !isPlaceholderSentinel;
+}
+
 // ── Video Player ──────────────────────────────────────────────────────────
 
 function VideoPlayer({ videoId }: { videoId: string }) {
@@ -77,7 +98,6 @@ function VideoPlayer({ videoId }: { videoId: string }) {
           onLoadedData={() => setLoaded(true)}
           onError={() => setErrored(true)}
         />
-        {/* Overlay only shown while video hasn't loaded */}
         {!loaded && (
           <div className="absolute inset-0 flex flex-col items-center justify-center bg-navy-900/80 pointer-events-none">
             {errored ? (
@@ -146,27 +166,162 @@ function TrackingSection({ tracking, usedReal }: {
   );
 }
 
+// ── Heatmap Section ───────────────────────────────────────────────────────
+
+function HeatmapSection({ heatmap }: { heatmap: FullAnalysisResult["heatmap"] }) {
+  const [playerImgError, setPlayerImgError] = useState(false);
+  const [ballImgError, setBallImgError]     = useState(false);
+
+  if (!heatmap) return null;
+
+  // Build absolute URLs for heatmap images.
+  // team_a_heatmap_url comes from the backend as "/results/..." relative URL.
+  const playerHeatmapUrl = heatmap.team_a_heatmap_url
+    ? `${BACKEND_BASE}${heatmap.team_a_heatmap_url}`
+    : null;
+  const ballHeatmapUrl = heatmap.ball_heatmap_url
+    ? `${BACKEND_BASE}${heatmap.ball_heatmap_url}`
+    : null;
+
+  const hasImages = !!(playerHeatmapUrl || ballHeatmapUrl);
+
+  return (
+    <div className="mb-6">
+      {/* Grid heatmap preview (always shown when matrix available) */}
+      <HeatmapPreview matrix={heatmap.heatmap_matrix ?? null} />
+
+      {/* Real heatmap image(s) from CV model */}
+      {hasImages && (
+        <div className="mt-3 glass-card rounded-xl p-4">
+          <div className="flex items-center gap-2 mb-3">
+            <p className="text-xs font-medium text-slate-400 uppercase tracking-wider">
+              Heatmap Images
+            </p>
+            <RealBadge />
+          </div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            {playerHeatmapUrl && !playerImgError && (
+              <div>
+                <p className="text-xs text-slate-600 mb-1">Players</p>
+                <img
+                  src={playerHeatmapUrl}
+                  alt="Player position heatmap"
+                  className="w-full rounded-lg object-cover"
+                  onError={() => setPlayerImgError(true)}
+                />
+              </div>
+            )}
+            {playerHeatmapUrl && playerImgError && (
+              <div className="rounded-lg bg-white/2 border border-white/5 flex flex-col items-center justify-center py-8">
+                <XCircle className="h-6 w-6 text-red-500/40 mb-2" />
+                <p className="text-xs text-slate-600">Player heatmap unavailable</p>
+                <p className="text-xs font-mono text-slate-700 mt-1 break-all px-2">{playerHeatmapUrl}</p>
+              </div>
+            )}
+            {ballHeatmapUrl && !ballImgError && (
+              <div>
+                <p className="text-xs text-slate-600 mb-1">Ball</p>
+                <img
+                  src={ballHeatmapUrl}
+                  alt="Ball position heatmap"
+                  className="w-full rounded-lg object-cover"
+                  onError={() => setBallImgError(true)}
+                />
+              </div>
+            )}
+            {ballHeatmapUrl && ballImgError && (
+              <div className="rounded-lg bg-white/2 border border-white/5 flex flex-col items-center justify-center py-8">
+                <XCircle className="h-6 w-6 text-red-500/40 mb-2" />
+                <p className="text-xs text-slate-600">Ball heatmap unavailable</p>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── Team Classification Section ───────────────────────────────────────────
 
-function TeamClassificationSection({ tc }: { tc: TeamClassificationResult }) {
-  const isReal =
-    tc.team_a_color !== "#FFFFFF" ||
-    tc.team_b_color !== "#003366" ||
-    tc.team_a_players.length !== 11 ||
-    tc.team_b_players.length !== 11;
+type TcDisplayState = "loading" | "success" | "fallback" | "error" | "unavailable";
 
+function resolveTcState(tc: TeamClassificationResult | null | undefined): TcDisplayState {
+  if (tc === undefined) return "loading";
+  if (tc === null) return "unavailable";
+  if (tc.status === "failed") return "error";
+
+  const isReal = isRealTeamClassification(tc);
+  return isReal ? "success" : "fallback";
+}
+
+function TeamClassificationSection({ tc }: { tc: TeamClassificationResult | null | undefined }) {
+  const state = resolveTcState(tc);
+
+  // Loading
+  if (state === "loading") {
+    return (
+      <div className="glass-card rounded-xl p-6 mb-6 flex items-center gap-3">
+        <Loader2 className="h-5 w-5 text-pitch-400 animate-spin shrink-0" />
+        <p className="text-sm text-slate-400">Loading team classification…</p>
+      </div>
+    );
+  }
+
+  // Unavailable / error
+  if (state === "unavailable" || state === "error") {
+    return (
+      <div className="glass-card rounded-xl p-6 mb-6">
+        <div className="flex items-center gap-2 mb-5">
+          <SectionHeading>Team Classification</SectionHeading>
+        </div>
+        <div className="flex items-start gap-3 rounded-lg border border-red-500/15 bg-red-500/5 px-4 py-3">
+          <XCircle className="h-4 w-4 text-red-400 shrink-0 mt-0.5" />
+          <p className="text-xs text-red-300/80">
+            {state === "error"
+              ? "Team classification failed. Check server logs for details."
+              : "Team classification data is unavailable for this video."}
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  // Fallback (placeholder data was returned)
+  if (state === "fallback") {
+    return (
+      <div className="glass-card rounded-xl p-6 mb-6">
+        <div className="flex items-center gap-2 mb-5">
+          <SectionHeading>Team Classification</SectionHeading>
+          <PlaceholderBadge />
+        </div>
+        <div className="flex items-start gap-3 rounded-lg border border-yellow-500/15 bg-yellow-500/5 px-4 py-3">
+          <AlertCircle className="h-4 w-4 text-yellow-400 shrink-0 mt-0.5" />
+          <p className="text-xs text-yellow-300/80">
+            Team classification returned placeholder data. The CV model ran but could not
+            produce real jersey-colour assignments — this happens when the model weights
+            are not loaded or when the video has too few detectable players.
+            Re-run analysis with <span className="font-mono">player_ball_detector.pt</span> present.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  // Success — real data
+  const realTc = tc!;
   const allPlayers = [
-    ...tc.team_a_players.map(p => ({ ...p, team: "A" as const })),
-    ...tc.team_b_players.map(p => ({ ...p, team: "B" as const })),
+    ...realTc.team_a_players.map(p => ({ ...p, team: "A" as const })),
+    ...realTc.team_b_players.map(p => ({ ...p, team: "B" as const })),
   ].sort((a, b) => a.player_id - b.player_id);
 
   const avgConfA =
-    tc.team_a_players.length > 0
-      ? tc.team_a_players.reduce((s, p) => s + p.confidence, 0) / tc.team_a_players.length
+    realTc.team_a_players.length > 0
+      ? realTc.team_a_players.reduce((s, p) => s + p.confidence, 0) / realTc.team_a_players.length
       : 0;
   const avgConfB =
-    tc.team_b_players.length > 0
-      ? tc.team_b_players.reduce((s, p) => s + p.confidence, 0) / tc.team_b_players.length
+    realTc.team_b_players.length > 0
+      ? realTc.team_b_players.reduce((s, p) => s + p.confidence, 0) / realTc.team_b_players.length
       : 0;
 
   return (
@@ -174,37 +329,25 @@ function TeamClassificationSection({ tc }: { tc: TeamClassificationResult }) {
       {/* Header */}
       <div className="flex items-center gap-2 mb-6">
         <SectionHeading>Team Classification</SectionHeading>
-        {isReal ? <RealBadge /> : <PlaceholderBadge />}
+        <RealBadge />
       </div>
-
-      {/* Diagnostic banner when not real */}
-      {!isReal && (
-        <div className="mb-5 rounded-lg border border-yellow-500/15 bg-yellow-500/5 px-4 py-3 flex items-start gap-3">
-          <AlertCircle className="h-4 w-4 text-yellow-400 shrink-0 mt-0.5" />
-          <p className="text-xs text-yellow-300/80">
-            Team classification returned placeholder data. This means the CV model
-            did not run, or the assignments file was not generated. Re-run analysis
-            with model weights present.
-          </p>
-        </div>
-      )}
 
       {/* Team color cards */}
       <div className="grid grid-cols-2 gap-4 mb-6">
         {[
           {
-            label: tc.team_a_label,
-            color: tc.team_a_color ?? "#FFFFFF",
-            count: tc.team_a_players.length,
+            label: realTc.team_a_label,
+            color: realTc.team_a_color ?? "#FFFFFF",
+            count: realTc.team_a_players.length,
             avgConf: avgConfA,
-            players: tc.team_a_players,
+            players: realTc.team_a_players,
           },
           {
-            label: tc.team_b_label,
-            color: tc.team_b_color ?? "#003366",
-            count: tc.team_b_players.length,
+            label: realTc.team_b_label,
+            color: realTc.team_b_color ?? "#003366",
+            count: realTc.team_b_players.length,
             avgConf: avgConfB,
-            players: tc.team_b_players,
+            players: realTc.team_b_players,
           },
         ].map(({ label, color, count, avgConf, players }) => (
           <div key={label} className="rounded-xl border border-white/5 bg-white/3 p-4">
@@ -274,8 +417,8 @@ function TeamClassificationSection({ tc }: { tc: TeamClassificationResult }) {
           <tbody className="divide-y divide-white/3">
             {allPlayers.map(player => {
               const teamColor = player.team === "A"
-                ? (tc.team_a_color ?? "#FFFFFF")
-                : (tc.team_b_color ?? "#003366");
+                ? (realTc.team_a_color ?? "#FFFFFF")
+                : (realTc.team_b_color ?? "#003366");
               const confPct = Math.round(player.confidence * 100);
               return (
                 <tr key={player.player_id} className="hover:bg-white/2 transition-colors">
@@ -445,38 +588,10 @@ export default function DashboardPage() {
         <TrackingSection tracking={tracking} usedReal={usedReal} />
 
         {/* Heatmap */}
-        <div className="mb-6">
-          <HeatmapPreview matrix={heatmap?.heatmap_matrix ?? null} />
-          {heatmap?.team_a_heatmap_url && (
-            <div className="mt-3 glass-card rounded-xl p-4">
-              <p className="text-xs text-slate-500 mb-2">Real heatmap images from CV model:</p>
-              <div className="grid grid-cols-2 gap-3">
-                {heatmap.team_a_heatmap_url && (
-                  <div>
-                    <p className="text-xs text-slate-600 mb-1">Players</p>
-                    <img src={`${BACKEND_BASE}${heatmap.team_a_heatmap_url}`} alt="Player heatmap" className="w-full rounded-lg object-cover" />
-                  </div>
-                )}
-                {heatmap.ball_heatmap_url && (
-                  <div>
-                    <p className="text-xs text-slate-600 mb-1">Ball</p>
-                    <img src={`${BACKEND_BASE}${heatmap.ball_heatmap_url}`} alt="Ball heatmap" className="w-full rounded-lg object-cover" />
-                  </div>
-                )}
-              </div>
-            </div>
-          )}
-        </div>
+        <HeatmapSection heatmap={heatmap} />
 
-        {/* Team Classification — real component */}
-        {team_classification ? (
-          <TeamClassificationSection tc={team_classification} />
-        ) : (
-          <div className="glass-card rounded-xl p-6 mb-6 flex items-center gap-3">
-            <AlertCircle className="h-5 w-5 text-slate-600 shrink-0" />
-            <p className="text-sm text-slate-500">Team classification data unavailable.</p>
-          </div>
-        )}
+        {/* Team Classification */}
+        <TeamClassificationSection tc={team_classification} />
 
         {/* Match stats */}
         {match_stats && (

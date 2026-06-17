@@ -7,9 +7,6 @@ import UploadBox from "@/components/UploadBox";
 import AnalysisStatus, { AnalysisStep } from "@/components/AnalysisStatus";
 import { uploadVideo, startAnalysis, formatBytes, toMediaUrl } from "@/lib/api";
 
-// "placeholder" re-uses the "pending" visual but with a distinct label.
-// We extend StepStatus locally — AnalysisStatus.tsx already renders
-// "pending" as a grey circle, which is perfect for placeholder steps.
 const INITIAL_STEPS: AnalysisStep[] = [
   {
     id: "upload",
@@ -38,26 +35,27 @@ const INITIAL_STEPS: AnalysisStep[] = [
   {
     id: "teams",
     label: "Team Classification",
-    description: "Demo only — kit colour classifier not connected yet",
+    description: "KMeans jersey-colour classifier assigning players to teams",
     status: "pending",
   },
   {
     id: "stats",
     label: "Match Statistics",
-    description: "Demo only — external statistics API not connected",
+    description: "⚠ Demo only — external statistics API not connected",
     status: "pending",
   },
   {
     id: "ai",
     label: "AI Tactical Analysis",
-    description: "Demo only — LLM tactical model not connected",
+    description: "⚠ Demo only — LLM tactical model not connected",
     status: "pending",
   },
 ];
 
-// Which steps are driven by real CV output vs placeholder services
-const REAL_STEP_IDS  = new Set(["upload", "detection", "tracking", "heatmap"]);
-const PLACEHOLDER_STEP_IDS = new Set(["teams", "stats", "ai"]);
+// Steps that are fully real CV steps (can be marked done or error)
+const REAL_STEP_IDS       = new Set(["upload", "detection", "tracking", "heatmap", "teams"]);
+// Steps that are always placeholder (keep grey, never red)
+const PLACEHOLDER_STEP_IDS = new Set(["stats", "ai"]);
 
 type Phase = "idle" | "uploading" | "analyzing" | "complete" | "error";
 
@@ -105,40 +103,66 @@ export default function UploadPage() {
 
       // ── 2. Mark real CV steps as running (all happen in one backend pass)
       setPhase("analyzing");
-      for (const id of ["detection", "tracking", "heatmap"]) {
+      for (const id of ["detection", "tracking", "heatmap", "teams"]) {
         updateStep(id, "running");
       }
 
-      // ── 3. Call backend — single blocking call, real work happens here ──
+      // ── 3. Call backend — single blocking call ────────────────────────────
       const analysisRes = await startAnalysis(vid);
 
-      // ── 4. Handle success=false (backend ran but reported failure) ───────
       if (!analysisRes.success) {
         throw new Error(analysisRes.message || "Analysis reported failure");
       }
 
-      // ── 5. Mark real CV steps done ────────────────────────────────────────
-      // Check each sub-result; if it came back, mark done, else error.
       const r = analysisRes.result;
 
+      // ── 4. Mark individual steps based on actual backend result ───────────
       updateStep("detection", r.detection ? "done" : "error");
       updateStep("tracking",  r.tracking  ? "done" : "error");
       updateStep("heatmap",   r.heatmap   ? "done" : "error");
 
-      // ── 6. Placeholder steps — always show as "pending" (grey circle) ────
-      // Update description to make placeholder status obvious in the UI.
-      updateStep("teams", "pending", "⚠ Demo placeholder — team classifier not connected");
+      // Team classification: mark done when backend returned real results
+      // (status=completed AND players were actually detected)
+      const tc = r.team_classification;
+      const teamsReal =
+        tc &&
+        tc.status === "completed" &&
+        (tc.team_a_players.length > 0 || tc.team_b_players.length > 0) &&
+        // Exclude the hardcoded placeholder sentinel values
+        !(
+          tc.team_a_color === "#FFFFFF" &&
+          tc.team_b_color === "#003366" &&
+          tc.team_a_players.length === 11 &&
+          tc.team_b_players.length === 11
+        );
+
+      if (teamsReal) {
+        updateStep(
+          "teams",
+          "done",
+          `${tc!.team_a_players.length + tc!.team_b_players.length} players classified into 2 teams`,
+        );
+      } else {
+        updateStep(
+          "teams",
+          tc ? "done" : "error",
+          tc
+            ? "⚠ Classification ran but used placeholder fallback — check CV model"
+            : "⚠ Team classification did not return data",
+        );
+      }
+
+      // ── 5. Placeholder steps ──────────────────────────────────────────────
       updateStep("stats", "pending", "⚠ Demo placeholder — statistics API not connected");
       updateStep("ai",    "pending", "⚠ Demo placeholder — AI model not connected");
 
-      // ── 7. Persist media URLs for Dashboard ──────────────────────────────
+      // ── 6. Persist media URLs for Dashboard ──────────────────────────────
       const videoUrl   = toMediaUrl(analysisRes.processed_video_url);
       const heatmapUrl = toMediaUrl(analysisRes.heatmap_url);
 
       if (videoUrl)   localStorage.setItem(`videoUrl_${vid}`,   videoUrl);
       if (heatmapUrl) localStorage.setItem(`heatmapUrl_${vid}`, heatmapUrl);
 
-      // Also persist the full result for the dashboard
       localStorage.setItem(`analysisResult_${vid}`, JSON.stringify(r));
 
       setPhase("complete");
@@ -149,16 +173,13 @@ export default function UploadPage() {
       setErrorMsg(msg);
       setPhase("error");
 
-      // Only fail steps that were genuinely running (real CV steps).
-      // Never turn placeholder steps red — they were never running.
       setSteps((prev) =>
         prev.map((s) => {
           if (s.status === "running" && REAL_STEP_IDS.has(s.id)) {
             return { ...s, status: "error" };
           }
           if (PLACEHOLDER_STEP_IDS.has(s.id)) {
-            // Keep grey — placeholder steps can't "fail"
-            return s;
+            return s; // Keep grey — placeholder steps can't "fail"
           }
           return s;
         })
