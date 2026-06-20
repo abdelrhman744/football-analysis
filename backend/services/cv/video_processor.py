@@ -1,7 +1,20 @@
 """
-video_processor.py — CV pipeline with H.264 browser-compatible output
-and improved team classification with multi-frame voting integrated into
-the frame loop.
+video_processor.py — CV pipeline with H.264 browser-compatible output.
+
+Changes in this revision
+------------------------
+* Per-team heatmaps (heatmap_team1, heatmap_team2) accumulated in the frame
+    loop after team assignment via TeamClassifier.predict(), matching the
+    notebook's two-accumulator pattern exactly.
+* Ball detection drawn as a green circle on the annotated frame (matches
+    notebook visualisation cell).
+* Player trajectory lines drawn per-frame in team colour using stored
+    track-point history (matches notebook's cv2.line() trajectory cell).
+* ProcessingOutput gains heatmap_team1_path and heatmap_team2_path fields.
+* _generate_per_team_heatmaps() added; _generate_heatmap() retained for the
+    combined all-player heatmap (served as heatmap_player_path).
+* config.py class IDs updated to best.pt layout:
+    CLASS_BALL=0, CLASS_GOALKEEPER=1, CLASS_PLAYER=2, CLASS_REFEREE=3
 """
 
 import cv2
@@ -37,10 +50,14 @@ class ProcessingOutput:
     used_real_model: bool = True
     detections_json_path: str | None = None
     tracking_json_path: str | None = None
+    # Combined all-player heatmap (existing field, kept for back-compat)
     heatmap_players_path: str | None = None
     heatmap_player_path: str | None = None
     heatmap_ball_path: str | None = None
     heatmap_matrix: list[list[float]] | None = None
+    # Per-team heatmaps (new)
+    heatmap_team1_path: str | None = None
+    heatmap_team2_path: str | None = None
     processed_video_path: str | None = None
     team_assignments_path: str | None = None
     warning: str | None = None
@@ -85,6 +102,8 @@ def process_match_video(
         heatmap_player_path=real.get("heatmap_path"),
         heatmap_ball_path=None,
         heatmap_matrix=None,
+        heatmap_team1_path=real.get("heatmap_team1_path"),
+        heatmap_team2_path=real.get("heatmap_team2_path"),
         processed_video_path=real.get("output_video_path"),
         team_assignments_path=real.get("team_assignments_path"),
         warning="; ".join(status.get("errors", [])) if status.get("errors") else None,
@@ -117,7 +136,7 @@ def process_video(
     try:
         model = YOLO(model_path)
         status["model_loaded"] = True
-        logger.info("[VideoProcessor] Model loaded: %s", model_path)
+        logger.info("[VideoProcessor] Model loaded: %s  classes=%s", model_path, model.names)
     except Exception as exc:
         status["errors"].append(f"Model load failed: {exc}")
         logger.error("[VideoProcessor] Model load failed: %s", exc)
@@ -164,7 +183,16 @@ def process_video(
         return _build_result({}, status)
 
     # ── 5. Per-frame inference loop ───────────────────────────────────────────
+    # Track-point history: tracker_id → list of (cx, cy) for trajectory lines
     all_track_points: dict[int, list[tuple[float, float]]] = {}
+
+    # Per-team heatmap accumulators (notebook pattern)
+    heatmap_team1 = np.zeros((height, width), dtype=np.float32)
+    heatmap_team2 = np.zeros((height, width), dtype=np.float32)
+
+    # Team colour lookup for trajectory lines: tracker_id → BGR tuple
+    track_team_color: dict[int, tuple[int, int, int]] = {}
+
     total_detections  = 0
     unique_track_ids: set[int] = set()
     detections_export: list[dict[str, Any]] = []
@@ -174,8 +202,8 @@ def process_video(
     #   Phase A: buffer first TRAINING_FRAMES frames for training
     #   Phase B: train once, then accumulate_vote() every frame, annotate
     team_clf: TeamClassifier | None = None
-    _train_buf_frames:  list[np.ndarray]          = []
-    _train_buf_dets:    list[list[dict[str, Any]]] = []
+    _train_buf_frames:  list[np.ndarray]           = []
+    _train_buf_dets:    list[list[dict[str, Any]]]  = []
     frame_idx = 0
 
     while True:
@@ -185,6 +213,7 @@ def process_video(
 
         # ── inference ─────────────────────────────────────────────────────────
         frame_dets: list[dict[str, Any]] = []
+        ball_det: dict[str, Any] | None = None
         try:
             results    = model.predict(frame, conf=conf_threshold, verbose=False)
             raw        = results[0]
@@ -198,6 +227,20 @@ def process_video(
                 confidence = float(detections.confidence[i]) if detections.confidence is not None else None
                 tracker_id = int(detections.tracker_id[i])  if detections.tracker_id is not None else None
 
+                det_entry = {
+                    "class_id":   class_id,
+                    "confidence": confidence,
+                    "tracker_id": tracker_id,
+                    "bbox":       [float(v) for v in xyxy],
+                }
+
+                # Separate ball detections so we can draw the circle.
+                # CLASS_BALL = 0 per best.pt layout.
+                if class_id == 0:
+                    ball_det = det_entry
+                else:
+                    frame_dets.append(det_entry)
+
                 if tracker_id is not None:
                     unique_track_ids.add(tracker_id)
                     cx = float((xyxy[0] + xyxy[2]) / 2)
@@ -210,19 +253,14 @@ def process_video(
                         "bbox":     [float(v) for v in xyxy],
                     })
 
-                frame_dets.append({
-                    "class_id":   class_id,
-                    "confidence": confidence,
-                    "tracker_id": tracker_id,
-                    "bbox":       [float(v) for v in xyxy],
-                })
-
-            detections_export.append({"frame": int(frame_idx), "detections": frame_dets})
+            all_dets_for_export = frame_dets + ([ball_det] if ball_det else [])
+            detections_export.append({"frame": int(frame_idx), "detections": all_dets_for_export})
 
         except Exception as exc:
             logger.warning("[VideoProcessor] Frame %d inference error: %s", frame_idx, exc)
             detections = sv.Detections.empty()
             frame_dets = []
+            ball_det   = None
 
         # ── team classifier: buffer → train → vote every frame ────────────────
         if team_clf is None:
@@ -265,19 +303,41 @@ def process_video(
                     except Exception:
                         pass
 
-        # ── annotate frame ────────────────────────────────────────────────────
+        # ── annotate frame (supervision boxes + labels + traces) ──────────────
+        # Referees pass through here and receive supervision bounding-box
+        # annotation. They are excluded only from the team-ellipse / trajectory
+        # / heatmap logic inside _draw_players (team_id == 0 sentinel check).
         try:
             annotated = bundle.annotate_frame(frame, detections)
             if annotated is None:
-                annotated = frame
+                annotated = frame.copy()
         except Exception as exc:
             if frame_idx == 0:
                 logger.warning("[VideoProcessor] Annotation disabled: %s", exc)
-            annotated = frame
+            annotated = frame.copy()
 
-        # ── team-colour ellipses ──────────────────────────────────────────────
+        # ── per-player: team ellipse + trajectory lines + heatmap update ──────
         if team_clf is not None:
-            annotated = _draw_team_ellipses(annotated, frame_dets, frame, team_clf)
+            annotated = _draw_players(
+                annotated=annotated,
+                frame_dets=frame_dets,
+                raw_frame=frame,
+                clf=team_clf,
+                track_points=all_track_points,
+                track_team_color=track_team_color,
+                heatmap_team1=heatmap_team1,
+                heatmap_team2=heatmap_team2,
+            )
+
+        # ── ball circle (green, matches notebook) ─────────────────────────────
+        if ball_det is not None:
+            try:
+                bx1, by1, bx2, by2 = (int(v) for v in ball_det["bbox"])
+                cx_b = (bx1 + bx2) // 2
+                cy_b = (by1 + by2) // 2
+                cv2.circle(annotated, (cx_b, cy_b), 10, (0, 255, 0), 3)
+            except Exception:
+                pass
 
         if annotated.shape[1] == width and annotated.shape[0] == height:
             out.write(annotated)
@@ -311,7 +371,6 @@ def process_video(
 
     status["frames_processed"] = int(frame_idx)
     if team_clf is not None:
-        # Finalise any players that haven't hit MIN_VOTES yet via predict()
         status["team_assignments_count"] = len(team_clf._cache)
 
     logger.info(
@@ -333,8 +392,7 @@ def process_video(
         status["output_written"] = True
         logger.info("[VideoProcessor] H.264 output: %s", output_path_obj)
 
-    # ── 7. Save JSON outputs + heatmap + team assignments ────────────────────
-    heatmap_path  = _generate_heatmap(all_track_points, width, height, str(output_path_obj))
+    # ── 7. Save JSON outputs + heatmaps + team assignments ────────────────────
     output_base   = output_path_obj.with_suffix("")
     det_json_path = str(output_base) + "_detections.json"
     trk_json_path = str(output_base) + "_tracking.json"
@@ -344,6 +402,14 @@ def process_video(
 
     with open(trk_json_path, "w", encoding="utf-8") as f:
         json.dump(numpy_to_python(tracking_export), f, ensure_ascii=False, indent=2)
+
+    # Combined all-player heatmap (existing behaviour)
+    heatmap_path = _generate_heatmap(all_track_points, width, height, str(output_path_obj))
+
+    # Per-team heatmaps (new — matches notebook)
+    heatmap_team1_path, heatmap_team2_path = _generate_per_team_heatmaps(
+        heatmap_team1, heatmap_team2, str(output_base)
+    )
 
     team_assign_path = _save_team_assignments(team_clf, str(output_base))
     if team_assign_path:
@@ -356,6 +422,8 @@ def process_video(
         "fps":                      float(round(fps, 2)),
         "resolution":               {"width": int(width), "height": int(height)},
         "heatmap_path":             heatmap_path,
+        "heatmap_team1_path":       heatmap_team1_path,
+        "heatmap_team2_path":       heatmap_team2_path,
         "output_video_path":        str(output_path_obj),
         "detections_json_path":     det_json_path,
         "tracking_json_path":       trk_json_path,
@@ -366,6 +434,117 @@ def process_video(
     }
 
     return _build_result(cv_data, status)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-frame drawing: team ellipses + trajectory lines + heatmap accumulation
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _draw_players(
+    annotated: np.ndarray,
+    frame_dets: list[dict[str, Any]],
+    raw_frame: np.ndarray,
+    clf: "TeamClassifier",
+    track_points: dict[int, list[tuple[float, float]]],
+    track_team_color: dict[int, tuple[int, int, int]],
+    heatmap_team1: np.ndarray,
+    heatmap_team2: np.ndarray,
+) -> np.ndarray:
+    """
+    For every tracked player in this frame:
+      1. Predict team via TeamClassifier (uses cached vote result after MIN_VOTES).
+      2. Draw a team-coloured ellipse under the player's feet.
+      3. Draw trajectory lines (all stored points so far) in team colour.
+      4. Accumulate the player's centre into the correct team heatmap grid.
+
+    Referees: class_id == CLASS_REFEREE detections are NOT in frame_dets
+    (they remain in the full detections set passed to bundle.annotate_frame,
+    which draws their bounding box via supervision). If a referee slips through
+    with team_id == 0 from the classifier, the sentinel check below skips them.
+
+    Non-fatal: returns original annotated frame on any error.
+    """
+    try:
+        canvas = annotated.copy()
+        h, w   = canvas.shape[:2]
+
+        for det in frame_dets:
+            tid  = det.get("tracker_id")
+            bbox = det.get("bbox")
+            if tid is None or bbox is None:
+                continue
+
+            try:
+                team_id = clf.predict(raw_frame, bbox, int(tid))
+            except Exception:
+                continue
+
+            if team_id == 0:
+                continue  # referee sentinel — skip team-colour rendering
+
+            # Resolve BGR colour from team centroid
+            bgr_arr = clf.team_colors.get(team_id)
+            if bgr_arr is not None:
+                bgr: tuple[int, int, int] = tuple(
+                    int(max(0, min(255, v))) for v in bgr_arr[:3]
+                )  # type: ignore[assignment]
+            else:
+                bgr = (255, 120, 0) if team_id == 1 else (0, 180, 255)
+
+            # Cache team colour per tracker (used for trajectory lines)
+            track_team_color[int(tid)] = bgr
+
+            x1, y1, x2, y2 = (int(v) for v in bbox)
+            cx = (x1 + x2) // 2
+            cy = (y1 + y2) // 2
+
+            # ── Team ellipse under feet ────────────────────────────────────
+            half_w = max(4, (x2 - x1) // 2)
+            cv2.ellipse(
+                canvas,
+                center=(cx, y2),
+                axes=(half_w, max(2, int(0.35 * half_w))),
+                angle=0.0,
+                startAngle=-45,
+                endAngle=235,
+                color=bgr,
+                thickness=3,
+                lineType=cv2.LINE_AA,
+            )
+
+            # ── Team label above box ───────────────────────────────────────
+            label = f"Team {team_id} | ID {int(tid)}"
+            cv2.putText(
+                canvas,
+                label,
+                (x1, max(0, y1 - 10)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                bgr,
+                2,
+                cv2.LINE_AA,
+            )
+
+            # ── Trajectory lines (notebook cv2.line pattern) ───────────────
+            pts = track_points.get(int(tid), [])
+            for i in range(1, len(pts)):
+                p0 = (int(pts[i - 1][0]), int(pts[i - 1][1]))
+                p1 = (int(pts[i][0]),     int(pts[i][1]))
+                cv2.line(canvas, p0, p1, bgr, 2, cv2.LINE_AA)
+
+            # ── Per-team heatmap accumulation (notebook pattern) ───────────
+            xi = int(np.clip(cx, 0, w - 1))
+            yi = int(np.clip(cy, 0, h - 1))
+            if team_id == 1:
+                heatmap_team1[yi, xi] += 1.0
+            else:
+                heatmap_team2[yi, xi] += 1.0
+
+        return canvas
+
+    except Exception as exc:
+        logger.debug("[VideoProcessor] _draw_players error: %s", exc)
+        return annotated
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -420,81 +599,18 @@ def _train_team_classifier(
         return None
 
 
-def _draw_team_ellipses(
-    annotated: np.ndarray,
-    frame_dets: list[dict[str, Any]],
-    raw_frame: np.ndarray,
-    clf: "TeamClassifier",
-) -> np.ndarray:
-    """
-    Draw a filled team-colour ellipse under each tracked player.
-    Skips referees (team_id == 0 sentinel).
-    Non-fatal — returns original frame on any error.
-    """
-    try:
-        canvas = annotated.copy()
-        for det in frame_dets:
-            tid  = det.get("tracker_id")
-            bbox = det.get("bbox")
-            if tid is None or bbox is None:
-                continue
-            try:
-                team_id = clf.predict(raw_frame, bbox, int(tid))
-            except Exception:
-                continue
-
-            if team_id == 0:
-                continue  # referee — skip ellipse
-
-            bgr_arr = clf.team_colors.get(team_id)
-            if bgr_arr is not None:
-                bgr = tuple(int(max(0, min(255, v))) for v in bgr_arr[:3])
-            else:
-                bgr = (255, 100, 30) if team_id == 1 else (30, 180, 255)
-
-            x1, y1, x2, y2 = (int(v) for v in bbox)
-            x_c    = (x1 + x2) // 2
-            half_w = max(4, (x2 - x1) // 2)
-
-            cv2.ellipse(
-                canvas,
-                center=(x_c, y2),
-                axes=(half_w, max(2, int(0.35 * half_w))),
-                angle=0.0,
-                startAngle=-45,
-                endAngle=235,
-                color=bgr,
-                thickness=3,
-                lineType=cv2.LINE_AA,
-            )
-        return canvas
-    except Exception as exc:
-        logger.debug("[VideoProcessor] _draw_team_ellipses error: %s", exc)
-        return annotated
-
-
 def _save_team_assignments(
     clf: "TeamClassifier | None",
     output_base: str,
 ) -> "str | None":
     """
     Persist team assignments to {output_base}_team_assignments.json.
-
-    JSON structure:
-    {
-      "team_1_color_hex": "#RRGGBB",
-      "team_2_color_hex": "#RRGGBB",
-      "team_1_color_bgr": [B, G, R],
-      "team_2_color_bgr": [B, G, R],
-      "assignments": {"<tracker_id>": 1_or_2, ...}
-    }
     """
     if clf is None or not clf._trained:
         logger.warning("[VideoProcessor] _save_team_assignments: classifier not trained")
         return None
     try:
-        path    = output_base + "_team_assignments.json"
-        # Only save players actually assigned to a team (exclude referee sentinel 0)
+        path = output_base + "_team_assignments.json"
         assignments = {
             str(k): int(v)
             for k, v in clf._cache.items()
@@ -563,7 +679,7 @@ def _reencode_h264(src: str, dst: str, fps: float) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Heatmap
+# Heatmap helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _generate_heatmap(
@@ -572,6 +688,7 @@ def _generate_heatmap(
     height: int,
     reference_path: str,
 ) -> "str | None":
+    """Combined all-player heatmap (existing behaviour, kept for back-compat)."""
     try:
         heatmap = np.zeros((height, width), dtype=np.float32)
         for points in track_points.values():
@@ -587,11 +704,59 @@ def _generate_heatmap(
         heatmap_color = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
         out_path = str(Path(reference_path).with_suffix("")) + "_heatmap.jpg"
         cv2.imwrite(out_path, heatmap_color)
-        logger.info("[VideoProcessor] Heatmap saved: %s", out_path)
+        logger.info("[VideoProcessor] Combined heatmap saved: %s", out_path)
         return out_path
     except Exception as exc:
-        logger.error("[VideoProcessor] Heatmap failed: %s", exc)
+        logger.error("[VideoProcessor] Combined heatmap failed: %s", exc)
         return None
+
+
+def _generate_per_team_heatmaps(
+    heatmap_team1: np.ndarray,
+    heatmap_team2: np.ndarray,
+    output_base: str,
+) -> tuple["str | None", "str | None"]:
+    """
+    Apply GaussianBlur((51,51)) + COLORMAP_JET to each per-team accumulator
+    and save as separate JPEG files, mirroring the notebook's heatmap cells.
+
+    Returns (team1_path, team2_path). Either may be None if the accumulator
+    was never incremented (no players classified for that team) or on error.
+    """
+    team1_path: "str | None" = None
+    team2_path: "str | None" = None
+
+    for team_idx, grid, suffix, label in (
+        (1, heatmap_team1, "_heatmap_team1.jpg", "Team 1"),
+        (2, heatmap_team2, "_heatmap_team2.jpg", "Team 2"),
+    ):
+        try:
+            if grid.max() == 0:
+                logger.info(
+                    "[VideoProcessor] Per-team heatmap: no data for %s — skipping", label
+                )
+                continue
+
+            blurred   = cv2.GaussianBlur(grid, (51, 51), 0)
+            norm      = cv2.normalize(blurred, None, 0, 255, cv2.NORM_MINMAX)
+            norm_u8   = np.uint8(norm)
+            colorized = cv2.applyColorMap(norm_u8, cv2.COLORMAP_JET)
+
+            save_path = output_base + suffix
+            cv2.imwrite(save_path, colorized)
+            logger.info("[VideoProcessor] %s heatmap saved: %s", label, save_path)
+
+            if team_idx == 1:
+                team1_path = save_path
+            else:
+                team2_path = save_path
+
+        except Exception as exc:
+            logger.error(
+                "[VideoProcessor] Per-team heatmap failed for %s: %s", label, exc
+            )
+
+    return team1_path, team2_path
 
 
 # ─────────────────────────────────────────────────────────────────────────────

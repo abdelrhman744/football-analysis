@@ -24,20 +24,20 @@ MODELS_DIR.mkdir(exist_ok=True)
 #
 #  Recommended layout:
 #    backend/models_weights/
-#      player_ball_detector.pt   ← YOLOv8 trained on football player+ball dataset
+#      best.pt                   ← YOLOv8 trained on football player+ball dataset
 #      team_classifier.pt        ← optional separate model for team colours
 #
 MODEL_WEIGHTS_PATH = os.environ.get(
     "MODEL_WEIGHTS_PATH",
-    str(MODELS_DIR / "player_ball_detector.pt"),
+    str(MODELS_DIR / "best.pt"),
 )
 
 # Class indices as used by your YOLO model.
 # Adjust these if your model uses different class IDs.
-CLASS_PLAYER    = int(os.environ.get("CLASS_PLAYER", 0))    # "player"
-CLASS_BALL      = int(os.environ.get("CLASS_BALL",   1))    # "ball"
-CLASS_REFEREE   = int(os.environ.get("CLASS_REFEREE", 2))   # "referee" (optional)
-CLASS_GOALKEEPER = int(os.environ.get("CLASS_GK",    3))    # "goalkeeper" (optional)
+CLASS_PLAYER    = int(os.environ.get("CLASS_BALL", 0))    # "ball"
+CLASS_BALL      = int(os.environ.get("CLASS_GK",   1))    # "goalkeeper"
+CLASS_REFEREE   = int(os.environ.get("CLASS_PLAYER", 2))   # "player"
+CLASS_GOALKEEPER = int(os.environ.get("CLASS_REFEREE", 3))    # "referee"
 
 # ── Inference settings ────────────────────────────────────────────────────────
 YOLO_CONF_THRESHOLD = float(os.environ.get("YOLO_CONF", 0.35))
