@@ -76,12 +76,22 @@ export interface TrackingResult {
   status: string;
 }
 
+export interface PlayerHeatmapSummary {
+  player_id: number;
+  team: string | null;
+  most_active_zone: string;
+  zone_share_pct: number;
+  summary: string;
+}
+
 export interface HeatmapData {
   video_id: string;
   team_a_heatmap_url: string | null;
   team_b_heatmap_url: string | null;
   ball_heatmap_url: string | null;
   heatmap_matrix: number[][] | null;
+  /** NEW: per-player text summaries from heatmap_summary_service */
+  player_summaries: PlayerHeatmapSummary[];
   status: string;
 }
 
@@ -119,10 +129,24 @@ export interface TeamStats {
 }
 
 export interface MatchStatsResult {
+  video_id?: string | null;
+  match_id?: string | null;
   home_team: TeamStats;
   away_team: TeamStats;
   status: string;
   data_source: string;
+  // NEW: real CV-derived analytics from services.stats_engine
+  possession: Record<string, number>;
+  ball_recovery: Record<string, number>;
+  passes: Record<string, number>;
+  passing_network: Record<string, number>;
+  attacks: Record<string, number>;
+  sprints: Record<string, number>;
+  ball_speed: { avg?: number; max?: number };
+  per_player: Record<string, any>;
+  possession_zones: Record<string, any>;
+  heatmap_matrix_a: number[][];
+  heatmap_matrix_b: number[][];
 }
 
 export interface AISummary {
@@ -248,6 +272,17 @@ export async function getAnalysisResult(videoId: string): Promise<FullAnalysisRe
   const res = await fetch(`${API_BASE_URL}/api/analysis/result/${videoId}`);
   if (!res.ok) {
     const msg = await extractErrorMessage(res, "Failed to fetch result");
+    throw new Error(msg);
+  }
+  return res.json();
+}
+
+/** NEW: fetches the single structured output object (match_stats, player_stats,
+ * team_stats, heatmaps, analysis_summary) — source of truth for RAG/chatbot. */
+export async function getUnifiedAnalysis(videoId: string): Promise<Record<string, any>> {
+  const res = await fetch(`${API_BASE_URL}/api/analysis/unified/${videoId}`);
+  if (!res.ok) {
+    const msg = await extractErrorMessage(res, "Failed to fetch unified analysis");
     throw new Error(msg);
   }
   return res.json();

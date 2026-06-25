@@ -238,6 +238,28 @@ function HeatmapSection({ heatmap }: { heatmap: FullAnalysisResult["heatmap"] })
           </div>
         </div>
       )}
+
+      {/* NEW: per-player heatmap text summaries (from heatmap_summary_service) */}
+      {heatmap.player_summaries && heatmap.player_summaries.length > 0 && (
+        <div className="mt-3 glass-card rounded-xl p-4">
+          <div className="flex items-center gap-2 mb-3">
+            <p className="text-xs font-medium text-slate-400 uppercase tracking-wider">
+              Player Zone Summaries
+            </p>
+            <RealBadge />
+          </div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-64 overflow-y-auto">
+            {heatmap.player_summaries.map((s) => (
+              <div key={s.player_id} className="rounded-lg bg-white/2 px-3 py-2">
+                <p className="text-xs text-slate-300">
+                  <span className="font-mono text-pitch-400">#{s.player_id}</span>{" "}
+                  {s.team ? `(Team ${s.team})` : ""} — {s.most_active_zone} ({s.zone_share_pct}%)
+                </p>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -598,10 +620,12 @@ export default function DashboardPage() {
           <div className="glass-card rounded-xl p-6 mb-6">
             <div className="flex items-center gap-2 mb-5">
               <SectionHeading>Match Statistics</SectionHeading>
-              <PlaceholderBadge />
+              {match_stats.data_source === "cv_tracking" ? <RealBadge /> : <PlaceholderBadge />}
             </div>
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
-              {[match_stats.home_team, match_stats.away_team].map((team, ti) => (
+              {[match_stats.home_team, match_stats.away_team].map((team, ti) => {
+                const teamKey = ti === 0 ? "A" : "B";
+                return (
                 <div key={team.team_name}>
                   <div className="flex items-center gap-2 mb-4">
                     <div className="h-3 w-3 rounded-sm" style={{ backgroundColor: ti === 0 ? "#ffffff" : "#003366" }} />
@@ -620,12 +644,12 @@ export default function DashboardPage() {
                   )}
                   <div className="grid grid-cols-3 gap-2">
                     {[
-                      { l: "Shots", v: team.shots },
-                      { l: "On Target", v: team.shots_on_target },
-                      { l: "xG", v: team.expected_goals },
                       { l: "Passes", v: team.passes },
                       { l: "Pass %", v: team.pass_accuracy != null ? `${team.pass_accuracy}%` : null },
-                      { l: "Fouls", v: team.fouls },
+                      { l: "Attacks", v: match_stats.attacks?.[teamKey] },
+                      { l: "Sprints", v: match_stats.sprints?.[teamKey] },
+                      { l: "Ball Recoveries", v: match_stats.ball_recovery?.[teamKey] },
+                      { l: "Shots", v: team.shots },
                     ].map(({ l, v }) => (
                       <div key={l} className="text-center py-2 px-1 rounded-lg bg-white/2">
                         <div className="text-lg font-display font-600 text-white">{v ?? "—"}</div>
@@ -634,8 +658,21 @@ export default function DashboardPage() {
                     ))}
                   </div>
                 </div>
-              ))}
+                );
+              })}
             </div>
+            {(match_stats.ball_speed?.avg != null) && (
+              <div className="mt-5 pt-5 border-t border-white/5 grid grid-cols-2 gap-4">
+                <div className="text-center py-2 px-1 rounded-lg bg-white/2">
+                  <div className="text-lg font-display font-600 text-white">{match_stats.ball_speed.avg} m/s</div>
+                  <div className="text-xs text-slate-600">Avg Ball Speed</div>
+                </div>
+                <div className="text-center py-2 px-1 rounded-lg bg-white/2">
+                  <div className="text-lg font-display font-600 text-white">{match_stats.ball_speed.max} m/s</div>
+                  <div className="text-xs text-slate-600">Max Ball Speed</div>
+                </div>
+              </div>
+            )}
           </div>
         )}
 
